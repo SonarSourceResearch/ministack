@@ -406,7 +406,8 @@ def _list_namespaces(data):
 
 
 def _create_service(data):
-    ns_id = data.get("NamespaceId")
+    # The namespace may come inside DnsConfig, the older form the Terraform provider still sends.
+    ns_id = data.get("NamespaceId") or (data.get("DnsConfig") or {}).get("NamespaceId")
     if not ns_id:
         return error_response_json("InvalidInput", "NamespaceId is required", 400)
     if ns_id not in _namespaces:

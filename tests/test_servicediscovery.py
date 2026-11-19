@@ -285,6 +285,28 @@ def test_servicediscovery_get_service(sd):
     sd.delete_service(Id=svc_id)
     sd.delete_namespace(Id=ns_id)
 
+def test_servicediscovery_create_service_with_namespace_in_dns_config(sd):
+    # The Terraform AWS provider (and Pulumi's, which bridges it) sends the namespace inside
+    # DnsConfig, the older form AWS still accepts, and no top-level NamespaceId.
+    ns_op = sd.create_private_dns_namespace(Name="dnsconfig.local", Vpc="vpc-12345")
+    ns_id = sd.get_operation(OperationId=ns_op["OperationId"])["Operation"]["Targets"]["NAMESPACE"]
+
+    svc = sd.create_service(
+        Name="egress",
+        DnsConfig={
+            "NamespaceId": ns_id,
+            "RoutingPolicy": "MULTIVALUE",
+            "DnsRecords": [{"Type": "A", "TTL": 10}],
+        },
+        HealthCheckCustomConfig={"FailureThreshold": 1},
+    )["Service"]
+    assert svc["NamespaceId"] == ns_id
+    assert sd.get_service(Id=svc["Id"])["Service"]["DnsConfig"]["NamespaceId"] == ns_id
+
+    sd.delete_service(Id=svc["Id"])
+    sd.delete_namespace(Id=ns_id)
+
+
 def test_servicediscovery_update_http_namespace(sd):
     ns_op = sd.create_http_namespace(
         Name="upd-http-ns",
