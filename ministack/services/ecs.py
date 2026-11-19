@@ -103,6 +103,8 @@ _ECS_RESTORE_RECONCILE_DELAY = float(
 # deployment: it can exit during its process startup.  Keep a short window
 # before completing a rollout so the lifecycle watcher can report that exit.
 _ECS_DEPLOYMENT_STEADY_DELAY = 1.0
+# How often a container waiting on `dependsOn` re-reads its dependencies' state.
+_DEPENDENCY_POLL = 0.1
 _ecs_reaper_started = False
 _ecs_reaper_lock = threading.Lock()
 
@@ -127,7 +129,7 @@ def _live_container_ids():
     for _key, task in _tasks.all_items():
         if task.get("lastStatus") == "STOPPED":
             continue
-        for cid in task.get("_docker_ids") or []:
+        for cid in [*(task.get("_docker_ids") or []), task.get("_holder_id")]:
             if cid:
                 ids.add(cid)
     return ids
@@ -137,8 +139,22 @@ container_reaper.register_live_ids("ecs", _live_container_ids)
 
 
 def _reap_exited_containers():
-    """Kept as a no-op shim: reclamation is owned by core.container_reaper."""
-    return
+    """Container reclamation is owned by core.container_reaper; this reclaims the task
+    volumes of stopped tasks, which can only go once the reaper has removed their containers."""
+    docker_client = _get_docker()
+    if not docker_client:
+        return
+    try:
+        volumes = docker_client.volumes.list(filters={"label": [
+            "ministack=ecs", f"{container_reaper.INSTANCE_LABEL}={container_reaper.instance_id()}",
+        ]})
+    except Exception:
+        return
+    for volume in volumes:
+        arn = (volume.attrs.get("Labels") or {}).get("com.amazonaws.ecs.task-arn", "")
+        task = _task_by_arn(arn)
+        if task is None or task.get("lastStatus") == "STOPPED":
+            _remove_docker_volume(docker_client, volume)
 
 
 def _ensure_ecs_reaper_thread():
@@ -175,7 +191,8 @@ def get_state():
     tasks = AccountRegionScopedDict()
     for scoped_key, task in _tasks._data.items():
         t = copy.deepcopy(task)
-        t.pop("_docker_ids", None)
+        for key in ("_docker_ids", "_docker_slots", "_holder_id", "_docker_volumes"):
+            t.pop(key, None)
         t.pop("_metadata_tokens", None)
         # The container is gone with the process; its address must not outlive it.
         t.pop("_container_ip", None)
@@ -1784,10 +1801,30 @@ def _register_metadata(task_arn, cluster_arn, td, cdef, launch_type, env,
     return token
 
 
-def _docker_binds_from_taskdef(td, cdef):
+def _task_volume_name(task_id, volume):
+    return f"ministack-ecs-{task_id[:8]}-{volume}"
+
+
+def _named_volumes(td):
+    """Task volumes that have no host path: ECS gives each task its own empty one,
+    shared by the containers that mount it and gone with the task. EFS, FSx and
+    Docker-driver volumes name a storage backend and stay unmodelled."""
+    names = []
+    for v in td.get("volumes", []):
+        name = v.get("Name") or v.get("name")
+        host = v.get("Host") or v.get("host") or {}
+        if (name and not (host.get("SourcePath") or host.get("sourcePath"))
+                and not any(key.endswith("VolumeConfiguration") for key in v)):
+            names.append(name)
+    return names
+
+
+def _docker_binds_from_taskdef(td, cdef, task_id=None):
     """Translate task-def `volumes` + container `mountPoints` into Docker
     bind strings. Returns a list (not a dict) so two ECS volume entries
     sharing the same host SourcePath don't collide on dict-key dedup.
+    A volume with no host path binds the task's own Docker volume when
+    `task_id` is given (see `_named_volumes`).
     """
     vol_src = {}
     for v in td.get("volumes", []):
@@ -1796,12 +1833,17 @@ def _docker_binds_from_taskdef(td, cdef):
             continue
         host = v.get("Host") or v.get("host") or {}
         vol_src[name] = host.get("SourcePath") or host.get("sourcePath")
+    own = set(_named_volumes(td)) if task_id else set()
     binds = []
     for mp in cdef.get("mountPoints", []):
         src = vol_src.get(mp.get("sourceVolume"))
         cp = mp.get("containerPath")
-        if src and cp:
-            mode = "ro" if mp.get("readOnly", False) else "rw"
+        mode = "ro" if mp.get("readOnly", False) else "rw"
+        if mp.get("sourceVolume") in own and cp:
+            # nocopy: a bind mount hides what the image holds at the path, and a
+            # Docker volume would otherwise be seeded with it on first use.
+            binds.append(f"{_task_volume_name(task_id, mp['sourceVolume'])}:{cp}:{mode},nocopy")
+        elif src and cp:
             binds.append(f"{src}:{cp}:{mode}")
     return binds
 
@@ -1813,9 +1855,21 @@ def _container_override_for(container_overrides, container_name):
     return {}
 
 
+def _docker_healthcheck(health_check):
+    """A container definition's healthCheck as Docker's healthcheck dict. Docker's defaults
+    are ECS's except the timeout (30s against 5s), which is set here."""
+    check = {"test": health_check["command"], "timeout": 5 * 1_000_000_000}
+    for key, field in (("interval", "interval"), ("timeout", "timeout"), ("start_period", "startPeriod")):
+        if health_check.get(field) is not None:
+            check[key] = int(health_check[field]) * 1_000_000_000
+    if health_check.get("retries") is not None:
+        check["retries"] = int(health_check["retries"])
+    return check
+
+
 def _build_run_kwargs(cdef, td, env, port_bindings, ecs_network,
                       host_mode, task_id, task_arn, ministack_net_ip,
-                      cluster_arn):
+                      cluster_arn, netns_holder=None):
     """Build kwargs for docker_client.containers.run from a container
     definition + task definition (privileged, cap_add, pid_mode, networking,
     bind mounts).
@@ -1823,7 +1877,7 @@ def _build_run_kwargs(cdef, td, env, port_bindings, ecs_network,
     lp = cdef.get("linuxParameters") or cdef.get("LinuxParameters") or {}
     caps = lp.get("Capabilities") or lp.get("capabilities") or {}
     cap_add = caps.get("Add") or caps.get("add") or []
-    binds = _docker_binds_from_taskdef(td, cdef)
+    binds = _docker_binds_from_taskdef(td, cdef, task_id)
 
     # A task definition's runtimePlatform says which architecture its image is
     # built for, and AWS launches it on that. Docker otherwise picks the host's,
@@ -1854,6 +1908,12 @@ def _build_run_kwargs(cdef, td, env, port_bindings, ecs_network,
         command=cdef.get("command"),
         privileged=bool(cdef.get("privileged") or cdef.get("Privileged")),
     )
+    if cdef.get("entryPoint"):
+        kwargs["entrypoint"] = cdef["entryPoint"]
+    if lp.get("initProcessEnabled"):
+        kwargs["init"] = True
+    if (cdef.get("healthCheck") or {}).get("command"):
+        kwargs["healthcheck"] = _docker_healthcheck(cdef["healthCheck"])
     if binds:
         kwargs["volumes"] = binds
     if cap_add:
@@ -1862,6 +1922,12 @@ def _build_run_kwargs(cdef, td, env, port_bindings, ecs_network,
         kwargs["pid_mode"] = "host"
     if host_mode:
         kwargs["network_mode"] = "host"
+    elif netns_holder:
+        # Joining the holder's namespace is what gives every container of an awsvpc
+        # task the one address of the task's attachment, and it keeps that address
+        # when this container exits. Docker refuses extra_hosts in this mode, which
+        # is why a holder needs MiniStack's own address (see _start_task_worker).
+        kwargs["network_mode"] = f"container:{netns_holder}"
     else:
         kwargs["network"] = ecs_network
         if not ministack_net_ip:
@@ -2069,6 +2135,15 @@ def _task_status_snapshot(task_arn):
     )
 
 
+def _task_by_arn(arn):
+    """The task record for an ARN, found by the account and region the ARN names."""
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        return None
+    return _tasks.get_scoped(spec.account_id, spec.region, arn)
+
+
 def _task_is_active(task_arn, task):
     return (
         _tasks.get(task_arn) is task
@@ -2100,12 +2175,29 @@ def _remove_docker_container(docker_client, container_or_id):
             pass
 
 
+def _remove_docker_volume(docker_client, volume_or_name):
+    if not docker_client or volume_or_name is None:
+        return
+    try:
+        volume = volume_or_name
+        if isinstance(volume_or_name, str):
+            volume = docker_client.volumes.get(volume_or_name)
+        volume.remove()
+    except Exception:
+        # Still held by an exited container the reaper has not removed yet, or already gone.
+        pass
+
+
 def _cleanup_task_resources(task, docker_client, extra_container=None):
     task_arn = task.get("taskArn", "")
     with resource_lock("ecs-task", task_arn):
         docker_ids = list(task.get("_docker_ids") or [])
         metadata_tokens = list(task.get("_metadata_tokens") or [])
+        holder_id = task.pop("_holder_id", None)
+        volumes = list(task.get("_docker_volumes") or [])
         task["_docker_ids"] = []
+        task["_docker_slots"] = []
+        task["_docker_volumes"] = []
         task["_metadata_tokens"] = []
 
     for token in metadata_tokens:
@@ -2120,6 +2212,10 @@ def _cleanup_task_resources(task, docker_client, extra_container=None):
     for docker_id in docker_ids:
         if docker_id not in seen:
             _remove_docker_container(docker_client, docker_id)
+    # Last: the containers joined the holder's namespace, and a volume cannot go while one uses it.
+    _remove_docker_container(docker_client, holder_id)
+    for volume in volumes:
+        _remove_docker_volume(docker_client, volume)
 
 
 # The downward half of the lifecycle, and whether each state raises an event.
@@ -2259,6 +2355,8 @@ def _attach_started_container(task, container, index, metadata_token, ecs_networ
         if not _task_is_active(task_arn, task):
             return False
         task.setdefault("_docker_ids", []).append(container_id)
+        # Containers start in dependency order, not definition order.
+        task.setdefault("_docker_slots", []).append(index)
         if index < len(task.get("containers", [])):
             task["containers"][index]["runtimeId"] = container_id[:12]
             task["containers"][index]["lastStatus"] = "RUNNING"
@@ -2485,11 +2583,150 @@ def _run_docker_container(
         raise
 
 
-def _fail_task_start(task, docker_client, reason):
+class _DependencyError(Exception):
+    """A container's dependsOn cannot be met, or an essential container exited while
+    the task was still starting: the task stops with `stop_code`."""
+
+    def __init__(self, reason, stop_code="TaskFailedToStart", exit_code=None):
+        super().__init__(reason)
+        self.stop_code = stop_code
+        self.exit_code = exit_code
+
+
+def _fail_task_start(task, docker_client, reason, stop_code="TaskFailedToStart", exit_code=None):
     try:
-        _mark_task_stopped(task["taskArn"], task, reason, "TaskFailedToStart")
+        _mark_task_stopped(task["taskArn"], task, reason, stop_code, exit_code=exit_code)
     finally:
         _cleanup_task_resources(task, docker_client)
+
+
+def _start_order(cdefs):
+    """`(index, definition)` pairs with every container after the ones it dependsOn,
+    keeping definition order where nothing says otherwise."""
+    names = {c["name"] for c in cdefs}
+    waiting, ordered, done = list(enumerate(cdefs)), [], set()
+    while waiting:
+        for item in waiting:
+            deps = [d["containerName"] for d in item[1].get("dependsOn") or []]
+            missing = next((d for d in deps if d not in names), None)
+            if missing:
+                raise _DependencyError(f"container {item[1]['name']} dependsOn {missing}, which is not defined")
+            if all(d in done for d in deps):
+                break
+        else:
+            raise _DependencyError("containers dependsOn each other in a cycle")
+        waiting.remove(item)
+        ordered.append(item)
+        done.add(item[1]["name"])
+    return ordered
+
+
+def _dependency_met(condition, container, dep_cdef, dependent):
+    """Whether `container` is in the state `condition` asks for; False while it may still
+    get there. Raises _DependencyError once it cannot. `container` was reloaded this poll."""
+    state = container.attrs.get("State") or {}
+    exited = container.status in ("exited", "dead")
+    code = state.get("ExitCode")
+    if condition == "COMPLETE":
+        return exited
+    if condition == "SUCCESS":
+        if exited and code != 0:
+            raise _DependencyError(
+                f"container {dependent} dependsOn {dep_cdef['name']} SUCCESS, which exited with code {code}")
+        return exited
+    if condition == "HEALTHY":
+        health = (state.get("Health") or {}).get("Status")
+        if not dep_cdef.get("healthCheck") or exited or health == "unhealthy":
+            raise _DependencyError(
+                f"container {dependent} dependsOn {dep_cdef['name']} HEALTHY, which cannot become healthy")
+        return health == "healthy"
+    return True  # START: it was started before this container's turn
+
+
+def _wait_for_dependencies(task, cdef, started):
+    """Block until every container `cdef` dependsOn is in its condition; False when the
+    task was stopped meanwhile. `started` maps a container name to
+    `(index, container, definition, start time)`.
+
+    Containers that exit while others wait are recorded, and an essential one ends the
+    task, as it would once the task is running (`_maybe_mark_stopped`)."""
+    task_arn = task["taskArn"]
+    deps = cdef.get("dependsOn") or []
+    if not deps:
+        return True
+    while True:
+        with resource_lock("ecs-task", task_arn):
+            if not _task_is_active(task_arn, task):
+                return False
+        for index, container, _, _ in started.values():
+            try:
+                container.reload()  # the SDK caches the status the container had when it was created
+            except Exception:
+                continue
+            if container.status not in ("exited", "dead") or task["containers"][index].get("exitCode") is not None:
+                continue
+            code = (container.attrs.get("State") or {}).get("ExitCode")
+            with resource_lock("ecs-task", task_arn):
+                task["containers"][index].update(lastStatus="STOPPED", exitCode=code)
+            if task["_container_essentials"][index]:
+                raise _DependencyError("Essential container in task exited", "EssentialContainerExited", code)
+        if all(_dependency_met(d.get("condition", "START"), started[d["containerName"]][1],
+                               started[d["containerName"]][2], cdef["name"]) for d in deps):
+            return True
+        for d in deps:
+            # startTimeout sits on the dependency: how long it has to reach its condition.
+            _, _, dep_cdef, began = started[d["containerName"]]
+            if dep_cdef.get("startTimeout") and time.monotonic() - began > dep_cdef["startTimeout"]:
+                raise _DependencyError(
+                    f"container {cdef['name']} dependsOn {dep_cdef['name']} {d.get('condition', 'START')},"
+                    f" which was not met within {dep_cdef['startTimeout']} seconds")
+        time.sleep(_DEPENDENCY_POLL)
+
+
+def _pause_image():
+    return os.environ.get("ECS_PAUSE_IMAGE", "registry.k8s.io/pause:3.10")
+
+
+def _start_netns_holder(task, docker_client, ecs_network):
+    """Start the container whose network namespace every container of an awsvpc task joins.
+
+    The task's address is the holder's, so it survives the first container exiting (an init
+    container) and is one address for all of them, as an ENI is. The image only has to
+    stay up; ECS_PAUSE_IMAGE names it for hosts that cannot reach the default."""
+    task_arn = task["taskArn"]
+    image = _pause_image()
+    try:
+        docker_client.images.get(image)
+    except Exception:
+        try:
+            docker_client.images.pull(image)
+        except Exception as exc:
+            raise _ImagePullError(f"{image}: {exc}") from exc
+    holder = docker_client.containers.run(
+        image, detach=True, network=ecs_network,
+        name=f"ministack-ecs-{task_arn.rsplit('/', 1)[-1][:8]}.pause",
+        labels={**container_reaper.own_labels("ecs"), "com.amazonaws.ecs.task-arn": task_arn},
+    )
+    with resource_lock("ecs-task", task_arn):
+        active = _task_is_active(task_arn, task)
+        if active:
+            task["_holder_id"] = holder.id
+    if not active:
+        _remove_docker_container(docker_client, holder)
+        return None
+    _record_task_ip(task, holder, ecs_network)
+    return holder.id
+
+
+def _create_task_volumes(task, td, docker_client):
+    """One Docker volume per task volume that has no host path, shared by the containers that mount it."""
+    task_id = task["taskArn"].rsplit("/", 1)[-1]
+    for name in _named_volumes(td):
+        volume = _task_volume_name(task_id, name)
+        docker_client.volumes.create(name=volume, labels=container_reaper.own_labels(
+            "ecs", **{"com.amazonaws.ecs.task-arn": task["taskArn"]}))
+        with resource_lock("ecs-task", task["taskArn"]):
+            task.setdefault("_docker_volumes", []).append(volume)
 
 
 def _start_task_worker(task, td, container_overrides, docker_client):
@@ -2520,10 +2757,24 @@ def _start_task_worker(task, td, container_overrides, docker_client):
     except Exception:
         logger.debug("ECS: could not detect Ministack network, using default")
 
-    for i, cdef in enumerate(td.get("containerDefinitions", [])):
+    cdefs = td.get("containerDefinitions", [])
+    order = _start_order(cdefs)
+    host_mode = td.get("networkMode") == "host"
+    _create_task_volumes(task, td, docker_client)
+    netns_holder = None
+    # Needs MiniStack's own address on the network: the holder's namespace cannot take the
+    # host.docker.internal mapping the fallback relies on.
+    if td.get("networkMode") == "awsvpc" and len(cdefs) > 1 and ministack_net_ip:
+        netns_holder = _start_netns_holder(task, docker_client, ecs_network)
+    started = {}
+
+    for i, cdef in order:
         with resource_lock("ecs-task", task_arn):
             active = _task_is_active(task_arn, task)
         if not active:
+            _cleanup_task_resources(task, docker_client)
+            return
+        if not _wait_for_dependencies(task, cdef, started):
             _cleanup_task_resources(task, docker_client)
             return
 
@@ -2557,7 +2808,6 @@ def _start_task_worker(task, td, container_overrides, docker_client):
                 host_port = pm.get("hostPort", pm.get("containerPort"))
                 port_bindings[f"{pm['containerPort']}/tcp"] = host_port
 
-        host_mode = td.get("networkMode") == "host"
         metadata_token = _register_metadata(
             task_arn, cluster_arn, td, cdef, launch_type, env,
             host_mode, ministack_net_ip,
@@ -2574,6 +2824,7 @@ def _start_task_worker(task, td, container_overrides, docker_client):
         run_kwargs = _build_run_kwargs(
             effective_cdef, td, env, port_bindings, ecs_network,
             host_mode, task_id, task_arn, ministack_net_ip, cluster_arn,
+            netns_holder=netns_holder,
         )
 
         with resource_lock("ecs-task", task_arn):
@@ -2598,6 +2849,7 @@ def _start_task_worker(task, td, container_overrides, docker_client):
             _cleanup_task_resources(task, docker_client, container)
             return
         _start_awslogs_forwarder(container, effective_cdef, task_id)
+        started[cdef["name"]] = (i, container, cdef, time.monotonic())
 
     if not _mark_task_running(task_arn, task):
         _cleanup_task_resources(task, docker_client)
@@ -2619,6 +2871,8 @@ def _run_task_worker(task, td, container_overrides, docker_client, account_id, r
         except _ImagePullError as exc:
             logger.warning("ECS: image pull failed for %s: %s", task["taskArn"], exc)
             _fail_task_start(task, docker_client, "CannotPullContainerError: " + str(exc))
+        except _DependencyError as exc:
+            _fail_task_start(task, docker_client, str(exc), exc.stop_code, exc.exit_code)
         except Exception as exc:
             logger.warning("ECS: Docker start failed for %s: %s", task["taskArn"], exc)
             _fail_task_start(
@@ -2869,6 +3123,8 @@ def _maybe_mark_stopped(task, docker_client=None):
                 or not task.get("_docker_ids")):
             return
         docker_ids = list(task["_docker_ids"])
+        slots = list(task.get("_docker_slots") or range(len(docker_ids)))
+        holder_id = task.get("_holder_id")
         essentials = list(task.get("_container_essentials") or [])
 
     docker_client = docker_client or _get_docker()
@@ -2878,7 +3134,7 @@ def _maybe_mark_stopped(task, docker_client=None):
     all_stopped = True
     exit_code = 0
     essential_exited = False
-    for index, docker_id in enumerate(docker_ids):
+    for index, docker_id in zip(slots, docker_ids):
         container_exit_code = None
         try:
             container = docker_client.containers.get(docker_id)
@@ -2916,6 +3172,13 @@ def _maybe_mark_stopped(task, docker_client=None):
         "EssentialContainerExited", exit_code=exit_code,
     )
     if stopped:
+        # ECS stops every container of a task whose essential container exited. They stay
+        # for the reaper, which is also what removes the task's volumes.
+        for docker_id in (*docker_ids, holder_id):
+            try:
+                docker_client.containers.get(docker_id).stop(timeout=5)
+            except Exception:
+                pass
         _cleanup_task_resources(task, None)
 
 
@@ -3856,6 +4119,7 @@ def reset():
                     f"{container_reaper.INSTANCE_LABEL}={container_reaper.instance_id()}",
                 ]}),
                 stop_timeout=2, force=True)
+            container_reaper.reap_volumes(docker_client, "ecs")
         except Exception:
             pass
     _clusters.clear()
