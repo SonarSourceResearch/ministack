@@ -6,7 +6,8 @@ multi-container tasks. Upstream is `ministackorg/ministack`; nothing here is pro
 
 - **Base:** upstream `v1.5.40` (2026-11-11), the newest release that was seven days old when the fork was made.
 - **Branch:** `vlh/ecs-patches`. Releases are tags `v<upstream>-vlh.<n>`; pin a tag, never the branch.
-- **Patches:** one commit on the base, touching `ministack/services/ecs.py`, one line in
+- **Patches:** one commit on the base (plus this note and the removal of upstream's three publish
+  workflows, which would try to push images and a package under upstream's names on a tag), touching `ministack/services/ecs.py`, one line in
   `ministack/app.py`, and the new `tests/test_ecs_containers.py`.
 
 ## What the patch changes
