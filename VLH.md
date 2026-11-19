@@ -18,7 +18,7 @@ ECS `RunTask` and service tasks, when MiniStack starts real containers:
    `ContainerOverride` has `command`, not `entryPoint`), so only the task definition's is read.
 2. **`dependsOn`** with `START`, `COMPLETE`, `SUCCESS` and `HEALTHY`. Containers start in dependency
    order, whatever the listing order, and a container waits until its dependencies are in their
-   condition (up to its `startTimeout` if set, otherwise until the task is stopped). A `SUCCESS` dependency that
+   condition (up to the dependency's `startTimeout` if set, otherwise until the task is stopped). A `SUCCESS` dependency that
    exits non-zero, a `HEALTHY` one that goes unhealthy or exits, an undefined name or a cycle stops the
    task with `TaskFailedToStart`. An essential container that exits while another is still waiting stops the
    task with `EssentialContainerExited`. The task stays `ACTIVATING` until its last container starts.

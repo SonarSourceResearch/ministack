@@ -148,6 +148,9 @@ def test_ecs_entrypoint_init_and_health_check_reach_docker_run(daemon):
         "test": ["CMD-SHELL", "true"], "interval": 5_000_000_000, "timeout": 2_000_000_000,
         "retries": 4, "start_period": 7_000_000_000,
     }
+    # ECS's default timeout is 5 seconds; Docker's is 30.
+    assert _ecs._docker_healthcheck({"command": ["CMD", "true"]}) == {
+        "test": ["CMD", "true"], "timeout": 5_000_000_000}
     _ecs._stop_task({"cluster": "ctr-run-kwargs-c", "task": task["taskArn"]})
 
 
@@ -336,10 +339,10 @@ def test_ecs_an_essential_exit_while_a_container_waits_stops_the_task(daemon):
     assert task["stopCode"] == "EssentialContainerExited"
 
 
-def test_ecs_depends_on_start_timeout_fails_the_task(daemon):
+def test_ecs_start_timeout_of_the_dependency_fails_the_task(daemon):
     task = _run("ctr-timeout", [
-        {"name": "slow", "image": "busybox", "essential": False},
-        {"name": "next", "image": "busybox", "startTimeout": 1,
+        {"name": "slow", "image": "busybox", "essential": False, "startTimeout": 1},
+        {"name": "next", "image": "busybox",
          "dependsOn": [{"containerName": "slow", "condition": "COMPLETE"}]},
     ])
     _wait_until(lambda: _stopped(task), timeout=10)

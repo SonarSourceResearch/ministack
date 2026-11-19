@@ -1856,9 +1856,9 @@ def _container_override_for(container_overrides, container_name):
 
 
 def _docker_healthcheck(health_check):
-    """A container definition's healthCheck as Docker's healthcheck dict; Docker's own
-    defaults are ECS's, so only what the definition names is sent."""
-    check = {"test": health_check["command"]}
+    """A container definition's healthCheck as Docker's healthcheck dict. Docker's defaults
+    are ECS's except the timeout (30s against 5s), which is set here."""
+    check = {"test": health_check["command"], "timeout": 5 * 1_000_000_000}
     for key, field in (("interval", "interval"), ("timeout", "timeout"), ("start_period", "startPeriod")):
         if health_check.get(field) is not None:
             check[key] = int(health_check[field]) * 1_000_000_000
@@ -2645,7 +2645,8 @@ def _dependency_met(condition, container, dep_cdef, dependent):
 
 def _wait_for_dependencies(task, cdef, started):
     """Block until every container `cdef` dependsOn is in its condition; False when the
-    task was stopped meanwhile. `started` maps a container name to `(index, container, definition)`.
+    task was stopped meanwhile. `started` maps a container name to
+    `(index, container, definition, start time)`.
 
     Containers that exit while others wait are recorded, and an essential one ends the
     task, as it would once the task is running (`_maybe_mark_stopped`)."""
@@ -2653,12 +2654,11 @@ def _wait_for_dependencies(task, cdef, started):
     deps = cdef.get("dependsOn") or []
     if not deps:
         return True
-    deadline = time.monotonic() + cdef["startTimeout"] if cdef.get("startTimeout") else None
     while True:
         with resource_lock("ecs-task", task_arn):
             if not _task_is_active(task_arn, task):
                 return False
-        for index, container, _ in started.values():
+        for index, container, _, _ in started.values():
             try:
                 container.reload()  # the SDK caches the status the container had when it was created
             except Exception:
@@ -2673,10 +2673,13 @@ def _wait_for_dependencies(task, cdef, started):
         if all(_dependency_met(d.get("condition", "START"), started[d["containerName"]][1],
                                started[d["containerName"]][2], cdef["name"]) for d in deps):
             return True
-        if deadline and time.monotonic() > deadline:
-            raise _DependencyError(
-                f"container {cdef['name']} dependsOn {', '.join(d['containerName'] for d in deps)}"
-                f" was not met within {cdef['startTimeout']} seconds")
+        for d in deps:
+            # startTimeout sits on the dependency: how long it has to reach its condition.
+            _, _, dep_cdef, began = started[d["containerName"]]
+            if dep_cdef.get("startTimeout") and time.monotonic() - began > dep_cdef["startTimeout"]:
+                raise _DependencyError(
+                    f"container {cdef['name']} dependsOn {dep_cdef['name']} {d.get('condition', 'START')},"
+                    f" which was not met within {dep_cdef['startTimeout']} seconds")
         time.sleep(_DEPENDENCY_POLL)
 
 
@@ -2846,7 +2849,7 @@ def _start_task_worker(task, td, container_overrides, docker_client):
             _cleanup_task_resources(task, docker_client, container)
             return
         _start_awslogs_forwarder(container, effective_cdef, task_id)
-        started[cdef["name"]] = (i, container, cdef)
+        started[cdef["name"]] = (i, container, cdef, time.monotonic())
 
     if not _mark_task_running(task_arn, task):
         _cleanup_task_resources(task, docker_client)
