@@ -34,6 +34,13 @@ ECS `RunTask` and service tasks, when MiniStack starts real containers:
 6. **`healthCheck`** reaches Docker's healthcheck (needed for `HEALTHY`).
 7. **Essential exit** stops the task's other containers (they were left running) and the pause container.
 
+## Other fixes
+
+- **Cloud Map `CreateService`** reads the namespace from `DnsConfig.NamespaceId` when the request has no
+  top-level `NamespaceId`. AWS accepts both; the Terraform AWS provider, and Pulumi's that bridges it, send
+  only the first, so a `pulumi up` declaring a DNS service failed with `NamespaceId is required`.
+  Test: `tests/test_servicediscovery.py::test_servicediscovery_create_service_with_namespace_in_dns_config`.
+
 ## Running the tests
 
 `tests/test_ecs_containers.py` has two halves. The first drives the task worker against a recording Docker
