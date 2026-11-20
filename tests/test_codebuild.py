@@ -879,3 +879,11 @@ def test_docker_executor_fails_a_build_whose_secret_does_not_resolve(monkeypatch
 
     assert build["buildStatus"] == "FAULT"
     assert docker.containers.image is None
+
+
+def test_codebuild_update_and_delete_take_the_project_arn(codebuild):
+    arn = codebuild.create_project(**_project_args("by-arn", "first"))["project"]["arn"]
+    updated = codebuild.update_project(name=arn, description="second")["project"]
+    assert updated["description"] == "second"
+    codebuild.delete_project(name=arn)
+    assert codebuild.batch_get_projects(names=["by-arn"])["projects"] == []

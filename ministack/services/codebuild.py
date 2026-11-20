@@ -935,7 +935,9 @@ def _list_projects(data):
 
 
 def _update_project(data):
-    name = data.get("name", "")
+    # The API takes a name or the project's ARN; the Terraform provider, and Pulumi's that
+    # bridges it, send the ARN it keeps as the resource id.
+    name = _project_name_from_identifier(data.get("name", "")) or ""
     if not name or name not in _projects:
         return error_response_json("ResourceNotFoundException",
                                    f"Project not found: {name}", 400)
@@ -953,7 +955,7 @@ def _update_project(data):
 
 
 def _delete_project(data):
-    name = data.get("name", "")
+    name = _project_name_from_identifier(data.get("name", "")) or ""
     if not name or name not in _projects:
         return error_response_json("ResourceNotFoundException",
                                    f"Project not found: {name}", 400)
