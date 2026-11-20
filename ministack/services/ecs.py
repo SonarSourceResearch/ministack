@@ -1763,6 +1763,13 @@ def _register_metadata(task_arn, cluster_arn, td, cdef, launch_type, env,
     env["AWS_CONTAINER_CREDENTIALS_FULL_URI"] = f"http://{host}:{port}/v2/credentials/{new_uuid()}"
     env["AWS_CONTAINER_AUTHORIZATION_TOKEN"] = secrets.token_urlsafe(32)
     env["AWS_ENDPOINT_URL"] = f"http://{host}:{port}"
+    # What ECS sets in every container besides: the region, which an SDK client made without
+    # one reads, and the launch type. A value the container definition sets is kept.
+    env.setdefault("AWS_REGION", get_region())
+    env.setdefault("AWS_DEFAULT_REGION", get_region())
+    env.setdefault(
+        "AWS_EXECUTION_ENV", "AWS_ECS_FARGATE" if launch_type == "FARGATE" else "AWS_ECS_EC2"
+    )
     # Seeded from the record, not a literal: the task is not RUNNING yet here.
     # Later transitions are pushed by _mark_task_activating/_running/_stopped.
     desired, known, per_container = (

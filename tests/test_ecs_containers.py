@@ -513,3 +513,23 @@ def test_ecs_depends_on_healthy_waits_for_a_real_health_check(ecs):
     task, containers = _await_stopped(ecs, cluster, arn)
     assert containers["app"]["exitCode"] == 0, containers
     ecs.delete_cluster(cluster=cluster)
+
+
+def test_every_container_gets_the_region_and_launch_type_ecs_sets(monkeypatch):
+    from ministack.services import ecs_metadata
+
+    monkeypatch.setattr(ecs_metadata, "register_container", lambda *a, **k: None)
+    task_arn = "arn:aws:ecs:eu-west-1:000000000000:task/c/1"
+    td = {"family": "f", "revision": 1}
+    env = {}
+    _ecs._register_metadata(task_arn, "cluster", td, {"name": "app", "image": "i"}, "FARGATE",
+                            env, False, "169.254.170.23")
+    region = env["AWS_REGION"]
+    assert region and env["AWS_DEFAULT_REGION"] == region
+    assert env["AWS_EXECUTION_ENV"] == "AWS_ECS_FARGATE"
+    # The container definition's own value wins.
+    env = {"AWS_REGION": "us-west-2"}
+    _ecs._register_metadata(task_arn, "cluster", td, {"name": "app", "image": "i"}, "EC2",
+                            env, False, "169.254.170.23")
+    assert env["AWS_REGION"] == "us-west-2"
+    assert env["AWS_EXECUTION_ENV"] == "AWS_ECS_EC2"
