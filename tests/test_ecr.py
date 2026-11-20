@@ -848,3 +848,21 @@ def test_ecr_held_image_archive_loads_as_its_repository_uri():
         with request_scope("111122223333", "us-east-2"):
             for store in (ecr._repositories, ecr._layer_blobs, ecr._manifest_blobs, ecr._images):
                 store.pop("held", None)
+
+
+def test_layer_download_url_names_the_registry_host_by_default(monkeypatch):
+    monkeypatch.delenv("ECR_LAYER_DOWNLOAD_ENDPOINT", raising=False)
+    _create_repository("layers")
+    body = _body(ecr_svc._get_download_url_for_layer(
+        {"repositoryName": "layers", "layerDigest": "sha256:" + "a" * 64}))
+    assert body["downloadUrl"] == (
+        "https://000000000000.dkr.ecr.us-east-1.amazonaws.com/v2/layers/blobs/sha256:" + "a" * 64
+    )
+
+
+def test_layer_download_url_can_point_at_ministacks_own_registry(monkeypatch):
+    monkeypatch.setenv("ECR_LAYER_DOWNLOAD_ENDPOINT", "http://ministack:4566/")
+    _create_repository("layers")
+    body = _body(ecr_svc._get_download_url_for_layer(
+        {"repositoryName": "layers", "layerDigest": "sha256:" + "b" * 64}))
+    assert body["downloadUrl"] == "http://ministack:4566/v2/layers/blobs/sha256:" + "b" * 64

@@ -619,8 +619,15 @@ def _get_download_url_for_layer(data):
         return error_response_json("RepositoryNotFoundException",
                                    f"The repository with name '{name}' does not exist", 400)
     layer_digest = data.get("layerDigest", "")
+    # AWS answers with a presigned HTTPS URL. By default this one names the registry host,
+    # which a client can reach only through something serving TLS for that name;
+    # ECR_LAYER_DOWNLOAD_ENDPOINT (`http://ministack:4566`) points it at MiniStack's own
+    # registry port instead, as Lambda's `Code.Location` points at MiniStack.
+    base = os.environ.get("ECR_LAYER_DOWNLOAD_ENDPOINT", "").rstrip("/") or (
+        f"https://{get_account_id()}.dkr.ecr.{get_region()}.amazonaws.com"
+    )
     return json_response({
-        "downloadUrl": f"https://{get_account_id()}.dkr.ecr.{get_region()}.amazonaws.com/v2/{name}/blobs/{layer_digest}",
+        "downloadUrl": f"{base}/v2/{name}/blobs/{layer_digest}",
         "layerDigest": layer_digest,
     })
 
