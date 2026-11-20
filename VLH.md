@@ -46,16 +46,18 @@ ECS `RunTask` and service tasks, when MiniStack starts real containers:
   MiniStack or the containers it started by name. This executor runs the project's image itself, on the
   network MiniStack is on: the buildspec's `install`, `pre_build`, `build` and `post_build` phases run in one
   shell from a generated script (a failed command fails its phase and the later ones, except `post_build`
-  after a failed `build`), `env.variables` are exported, and `env.secrets-manager`, `env.parameter-store` and
-  `env.exported-variables` are refused. The service role reaches the build from MiniStack's container
-  credentials endpoint (`AWS_CONTAINER_CREDENTIALS_FULL_URI`), with `AWS_ENDPOINT_URL` at MiniStack; a
+  after a failed `build`), `env.variables` are exported unless a project or StartBuild variable of the same
+  name is set, and `env.secrets-manager`, `env.parameter-store`, `env.exported-variables` and a phase's
+  `finally`, `on-failure` and `run-as` are refused. The service role reaches the build from MiniStack's
+  container credentials endpoint (`AWS_CONTAINER_CREDENTIALS_FULL_URI`) unless the project declares keys, with
+  `AWS_ENDPOINT_URL` at MiniStack unless the project names one; a
   `SECRETS_MANAGER` or `PARAMETER_STORE` environment variable is resolved, and one that does not resolve
   faults the build. A privileged build gets a Docker volume at `/var/lib/docker`, removed with the build,
   so a daemon it starts can use overlay2. `CODEBUILD_DOCKER_FLAGS` apply to the build container under this
   executor, bind mounts included, and its `--network` is a second network the build joins before its first
   command. Tests: `tests/test_codebuild.py`, the `docker_executor` and `phase_script` tests.
 - **`ECR_LAYER_DOWNLOAD_ENDPOINT`** points `GetDownloadUrlForLayer` at MiniStack's own registry port
-  (`http://ministack:4566/v2/...`) instead of `https://<account>.dkr.ecr.<region>.amazonaws.com/v2/...`,
+  (`http://ministack:4566/v2/...?ns=<registry host>`, the hint naming the tenant) instead of `https://<account>.dkr.ecr.<region>.amazonaws.com/v2/...`,
   which a client reaches only through a TLS front whose certificate it trusts. Tests:
   `tests/test_ecr.py::test_layer_download_url_*`.
 - **What ECS sets in every container:** `AWS_REGION`, `AWS_DEFAULT_REGION` and `AWS_EXECUTION_ENV`

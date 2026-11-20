@@ -865,4 +865,7 @@ def test_layer_download_url_can_point_at_ministacks_own_registry(monkeypatch):
     _create_repository("layers")
     body = _body(ecr_svc._get_download_url_for_layer(
         {"repositoryName": "layers", "layerDigest": "sha256:" + "b" * 64}))
-    assert body["downloadUrl"] == "http://ministack:4566/v2/layers/blobs/sha256:" + "b" * 64
+    assert body["downloadUrl"] == (
+        "http://ministack:4566/v2/layers/blobs/sha256:" + "b" * 64
+        + "?ns=000000000000.dkr.ecr.us-east-1.amazonaws.com"
+    )

@@ -544,11 +544,19 @@ def _phase_script(buildspec):
         if env.get(unsupported):
             raise ValueError(f"buildspec env.{unsupported} is not supported by this executor")
     lines = ["status=0", "failed_before_build=0"]
+    # The lowest precedence, as on CodeBuild: a project or StartBuild variable of the same name,
+    # already in the container's environment, wins.
     for name, value in (env.get("variables") or {}).items():
-        lines.append(f"export {name}={shlex.quote(str(value))}")
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(name)):
+            raise ValueError(f"buildspec env.variables name {name!r} is not a variable name")
+        lines.append(f'[ -n "${{{name}+set}}" ] || export {name}={shlex.quote(str(value))}')
     phases = spec.get("phases") or {}
     for phase in _PHASES:
-        commands = (phases.get(phase) or {}).get("commands") or []
+        block = phases.get(phase) or {}
+        for unsupported in ("finally", "on-failure", "run-as"):
+            if unsupported in block:
+                raise ValueError(f"buildspec {phase}.{unsupported} is not supported by this executor")
+        commands = block.get("commands") or []
         if not commands:
             continue
         label = phase.upper()
@@ -644,17 +652,19 @@ def _start_direct_build(client, build, project, image_name, buildspec):
         "AWS_DEFAULT_REGION": get_region(),
         "AWS_REGION": get_region(),
     })
-    if endpoint and "AWS_ENDPOINT_URL" not in variables:
-        variables["AWS_ENDPOINT_URL"] = endpoint
+    if endpoint:
+        variables.setdefault("AWS_ENDPOINT_URL", endpoint)
+    # The service role, whatever endpoint the project names, the way CodeBuild hands it over:
+    # from a container credentials endpoint, which botocore and the AWS CLI both read. Keys
+    # the project declares are left to it.
+    if "AWS_ACCESS_KEY_ID" not in variables:
         if address:
-            # The service role, the way CodeBuild hands it over: from a container
-            # credentials endpoint, which botocore and the AWS CLI both read.
             variables["AWS_CONTAINER_CREDENTIALS_FULL_URI"] = (
                 f"http://{address}:{port}/v2/credentials/{_uuid()}"
             )
             variables["AWS_CONTAINER_AUTHORIZATION_TOKEN"] = _secrets.token_urlsafe(32)
         else:
-            variables.setdefault("AWS_ACCESS_KEY_ID", "test")
+            variables["AWS_ACCESS_KEY_ID"] = "test"
             variables.setdefault("AWS_SECRET_ACCESS_KEY", "test")
     privileged = bool(env.get("privilegedMode"))
     mounts = []

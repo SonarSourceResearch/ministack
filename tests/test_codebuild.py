@@ -676,6 +676,26 @@ def test_phase_script_reads_json_buildspecs_and_defaults_to_sh(tmp_path):
     assert code == 0 and "json" in out.splitlines()
 
 
+def test_phase_script_lets_project_variables_win_over_buildspec_ones(tmp_path):
+    spec = (
+        "version: 0.2\nenv:\n  variables:\n    TAG: from-buildspec\n    SPACED: 'a b'\n"
+        "phases:\n  build:\n    commands:\n      - echo \"$TAG|$SPACED\"\n"
+    )
+    script, shell = codebuild._phase_script(spec)
+    done = subprocess.run(
+        [shell, "-c", script], cwd=tmp_path, capture_output=True, text=True,
+        env={"PATH": "/usr/bin:/bin", "TAG": "from-project"},
+    )
+    assert "from-project|a b" in done.stdout.splitlines()
+
+
+@pytest.mark.parametrize("key", ["finally", "on-failure", "run-as"])
+def test_phase_script_refuses_phase_keys_it_does_not_run(key):
+    spec = f"version: 0.2\nphases:\n  build:\n    {key}: x\n    commands:\n      - echo hi\n"
+    with pytest.raises(ValueError, match=key):
+        codebuild._phase_script(spec)
+
+
 def test_phase_script_refuses_secret_variables():
     spec = "version: 0.2\nenv:\n  secrets-manager:\n    TOKEN: arn:x\nphases: {}\n"
     with pytest.raises(ValueError, match="secrets-manager"):
@@ -800,7 +820,8 @@ def test_docker_executor_keeps_an_endpoint_the_project_declared(monkeypatch, tmp
 
     env = docker.containers.kwargs["environment"]
     assert env["AWS_ENDPOINT_URL"] == "http://elsewhere:4566"
-    assert "AWS_CONTAINER_CREDENTIALS_FULL_URI" not in env
+    # The service role reaches the build whatever endpoint the project names.
+    assert env["AWS_CONTAINER_CREDENTIALS_FULL_URI"].startswith("http://169.254.170.23:4566/")
     assert container.events == ["start"]
 
 

@@ -623,13 +623,14 @@ def _get_download_url_for_layer(data):
     # which a client can reach only through something serving TLS for that name;
     # ECR_LAYER_DOWNLOAD_ENDPOINT (`http://ministack:4566`) points it at MiniStack's own
     # registry port instead, as Lambda's `Code.Location` points at MiniStack.
-    base = os.environ.get("ECR_LAYER_DOWNLOAD_ENDPOINT", "").rstrip("/") or (
-        f"https://{get_account_id()}.dkr.ecr.{get_region()}.amazonaws.com"
+    registry_host = f"{get_account_id()}.dkr.ecr.{get_region()}.amazonaws.com"
+    override = os.environ.get("ECR_LAYER_DOWNLOAD_ENDPOINT", "").rstrip("/")
+    # Off the registry host, the `ns` hint names the tenant the registry serves the blob from.
+    url = (
+        f"{override}/v2/{name}/blobs/{layer_digest}?ns={registry_host}" if override
+        else f"https://{registry_host}/v2/{name}/blobs/{layer_digest}"
     )
-    return json_response({
-        "downloadUrl": f"{base}/v2/{name}/blobs/{layer_digest}",
-        "layerDigest": layer_digest,
-    })
+    return json_response({"downloadUrl": url, "layerDigest": layer_digest})
 
 
 def _batch_check_layer_availability(data):
