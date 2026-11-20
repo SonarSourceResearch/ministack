@@ -240,8 +240,20 @@ AGENT_IMAGE = "public.ecr.aws/codebuild/local-builds:latest"
 # agent container; not an AWS concept, so not configurable.
 WORKSPACE = "/tmp/ministack-codebuild"
 
+# How an executed build runs. "agent" (the default) hands the buildspec to AWS's
+# local agent above. "docker" runs the project's image itself, as CodeBuild does:
+# one container on the network MiniStack is on, the buildspec's phases run by a
+# shell script MiniStack writes, the service role's credentials served from
+# MiniStack's container-credentials endpoint. Use it when the build must reach
+# MiniStack and the containers it started by name, or needs flags of its own:
+# the agent starts the build container on a network of its own choosing and
+# passes it no flags.
+CODEBUILD_EXECUTOR = os.environ.get("MINISTACK_CODEBUILD_EXECUTOR", "agent").lower()
+
 # Extra `docker run` flags for the AGENT container, with the same syntax and the
-# same parser as LAMBDA_DOCKER_FLAGS.
+# same parser as LAMBDA_DOCKER_FLAGS. Under the "docker" executor they apply to
+# the build container instead, volumes included, and a `--network` there is a
+# second network the build joins besides MiniStack's.
 #
 # The agent's entire job is to drive the Docker socket it is handed, so on an
 # SELinux-enforcing host it needs `--security-opt label=disable` to function at
@@ -454,46 +466,190 @@ def _execute_build(build_id, project):
             if image_name is None:
                 raise RuntimeError(f"{env['image']}: not found in this MiniStack's ECR for the host platform")
 
-        run_kwargs = dict(
-            detach=True,
-            environment={
-                "LOCAL_AGENT_IMAGE_NAME": AGENT_IMAGE,
-                "IMAGE_NAME": image_name,
-                "SOURCE": source_dir,
-                "MOUNT_SOURCE_DIRECTORY": "TRUE",
-                "ARTIFACTS": artifacts_dir,
-                "BUILDSPEC": buildspec_path,
-                "ENV_VAR_FILE": "env.list",
-                "INITIATOR": "ministack",
-                "DOCKER_PRIVILEGED_MODE": "true" if env.get("privilegedMode") else "",
-            },
-            volumes={
-                "/var/run/docker.sock": {"bind": "/var/run/docker.sock", "mode": "rw"},
-                env_dir: {"bind": "/LocalBuild/envFile", "mode": "ro"},
-            },
-            labels=container_reaper.own_labels("codebuild", **{"ministack.codebuild.build": build_id}),
-        )
-
-        if CODEBUILD_DOCKER_FLAGS:
-            # Imported here rather than at module scope: the services package
-            # loads its modules eagerly, and a top-level cross-service import
-            # would order codebuild after lambda.
-            from ministack.services.lambda_svc import _parse_docker_flags
-
-            extra = _parse_docker_flags(CODEBUILD_DOCKER_FLAGS)
-            # The volumes above are what the agent contract requires; a --volume
-            # in the flags would silently replace them, so it is dropped.
-            extra.pop("mounts", None)
-            run_kwargs["environment"].update(extra.pop("environment", {}))
-            run_kwargs.update(extra)
-
-        container = client.containers.run(AGENT_IMAGE, **run_kwargs)
+        if CODEBUILD_EXECUTOR == "docker":
+            container = _start_direct_build(client, build, project, image_name, buildspec)
+        else:
+            container = _start_agent_build(
+                client, build_id, env, image_name, source_dir, artifacts_dir, buildspec_path,
+                env_dir,
+            )
         _live_build_containers.add(getattr(container, "id", None))
     except Exception:
         logger.exception("Failed to start build %s", build_id)
         _finish_build(build, "FAULT")
         return
 
+    _follow_build(build_id, build, project, container)
+
+
+def _start_agent_build(client, build_id, env, image_name, source_dir, artifacts_dir,
+                       buildspec_path, env_dir):
+    """Start the AWS local agent, which starts the build container itself."""
+    run_kwargs = dict(
+        detach=True,
+        environment={
+            "LOCAL_AGENT_IMAGE_NAME": AGENT_IMAGE,
+            "IMAGE_NAME": image_name,
+            "SOURCE": source_dir,
+            "MOUNT_SOURCE_DIRECTORY": "TRUE",
+            "ARTIFACTS": artifacts_dir,
+            "BUILDSPEC": buildspec_path,
+            "ENV_VAR_FILE": "env.list",
+            "INITIATOR": "ministack",
+            "DOCKER_PRIVILEGED_MODE": "true" if env.get("privilegedMode") else "",
+        },
+        volumes={
+            "/var/run/docker.sock": {"bind": "/var/run/docker.sock", "mode": "rw"},
+            env_dir: {"bind": "/LocalBuild/envFile", "mode": "ro"},
+        },
+        labels=container_reaper.own_labels("codebuild", **{"ministack.codebuild.build": build_id}),
+    )
+
+    if CODEBUILD_DOCKER_FLAGS:
+        # Imported here rather than at module scope: the services package
+        # loads its modules eagerly, and a top-level cross-service import
+        # would order codebuild after lambda.
+        from ministack.services.lambda_svc import _parse_docker_flags
+
+        extra = _parse_docker_flags(CODEBUILD_DOCKER_FLAGS)
+        # The volumes above are what the agent contract requires; a --volume
+        # in the flags would silently replace them, so it is dropped.
+        extra.pop("mounts", None)
+        run_kwargs["environment"].update(extra.pop("environment", {}))
+        run_kwargs.update(extra)
+
+    return client.containers.run(AGENT_IMAGE, **run_kwargs)
+
+
+# The buildspec phases the "docker" executor runs, in CodeBuild's order.
+_PHASES = ("install", "pre_build", "build", "post_build")
+
+
+def _phase_script(buildspec):
+    """A shell script that runs the buildspec's phases the way CodeBuild does.
+
+    One shell runs every command, so a `cd` or an exported variable carries to the
+    next command and phase. A failing command fails its phase and the phases after
+    it, except POST_BUILD, which runs after a failed BUILD; each phase that ran
+    prints the "Phase complete" line the log reader records. Secrets Manager and
+    Parameter Store variables are refused rather than left unset.
+    """
+    import shlex
+
+    import yaml
+
+    spec = yaml.safe_load(buildspec) or {}
+    env = spec.get("env") or {}
+    for unsupported in ("secrets-manager", "parameter-store", "exported-variables"):
+        if env.get(unsupported):
+            raise ValueError(f"buildspec env.{unsupported} is not supported by this executor")
+    lines = ["status=0", "failed_before_build=0"]
+    for name, value in (env.get("variables") or {}).items():
+        lines.append(f"export {name}={shlex.quote(str(value))}")
+    phases = spec.get("phases") or {}
+    for phase in _PHASES:
+        commands = (phases.get(phase) or {}).get("commands") or []
+        if not commands:
+            continue
+        label = phase.upper()
+        guard = '[ "$failed_before_build" -eq 0 ]' if phase == "post_build" else '[ "$status" -eq 0 ]'
+        lines.append(f"if {guard}; then")
+        lines.append(f"  echo '[Container] Entering phase {label}'")
+        lines.append("  phase=0")
+        for command in commands:
+            quoted = shlex.quote(str(command))
+            lines.append(f"  if [ \"$phase\" -eq 0 ]; then")
+            lines.append(f"    echo {shlex.quote('[Container] Running command ' + str(command))}")
+            lines.append(f"    eval {quoted} || phase=$?")
+            lines.append("  fi")
+        lines.append('  if [ "$phase" -eq 0 ]; then')
+        lines.append(f"    echo 'Phase complete: {label} State: SUCCEEDED'")
+        lines.append("  else")
+        lines.append(f"    echo 'Phase complete: {label} State: FAILED'")
+        lines.append("    status=$phase")
+        if phase in ("install", "pre_build"):
+            lines.append("    failed_before_build=1")
+        lines.append("  fi")
+        lines.append("fi")
+    lines.append('exit "$status"')
+    return "\n".join(lines) + "\n", env.get("shell") or "sh"
+
+
+def _own_network(client):
+    """(network, address) of MiniStack's own container, as ECS tasks find it; Nones off Docker."""
+    try:
+        own = client.containers.get(os.environ.get("HOSTNAME", ""))
+        networks = own.attrs["NetworkSettings"]["Networks"]
+        name = next(iter(networks))
+        return name, networks[name].get("IPAddress") or None
+    except Exception:
+        return None, None
+
+
+def _start_direct_build(client, build, project, image_name, buildspec):
+    """Start the project's image as the build container ("docker" executor)."""
+    import secrets as _secrets
+
+    from ministack.core.responses import new_uuid as _uuid
+
+    env = project.get("environment", {}) or {}
+    script, shell = _phase_script(buildspec)
+    network, address = _own_network(client)
+    port = os.environ.get("GATEWAY_PORT") or os.environ.get("EDGE_PORT") or "4566"
+    endpoint = f"http://{address}:{port}" if address else _aws_endpoint()
+    variables = {var.get("name", ""): var.get("value", "") for var in env.get("environmentVariables") or []}
+    variables.update({
+        "CODEBUILD_BUILD_ID": build["id"],
+        "CODEBUILD_BUILD_ARN": build["arn"],
+        "CODEBUILD_BUILD_NUMBER": str(build["buildNumber"]),
+        "CODEBUILD_INITIATOR": build["initiator"],
+        "CODEBUILD_SRC_DIR": "/codebuild/output/src",
+        "AWS_DEFAULT_REGION": get_region(),
+        "AWS_REGION": get_region(),
+    })
+    if endpoint and "AWS_ENDPOINT_URL" not in variables:
+        variables["AWS_ENDPOINT_URL"] = endpoint
+        if address:
+            # The service role, the way CodeBuild hands it over: from a container
+            # credentials endpoint, which botocore and the AWS CLI both read.
+            variables["AWS_CONTAINER_CREDENTIALS_FULL_URI"] = (
+                f"http://{address}:{port}/v2/credentials/{_uuid()}"
+            )
+            variables["AWS_CONTAINER_AUTHORIZATION_TOKEN"] = _secrets.token_urlsafe(32)
+        else:
+            variables.setdefault("AWS_ACCESS_KEY_ID", "test")
+            variables.setdefault("AWS_SECRET_ACCESS_KEY", "test")
+    create_kwargs = dict(
+        command=[shell, "-c", script],
+        working_dir=variables["CODEBUILD_SRC_DIR"],
+        environment=variables,
+        privileged=bool(env.get("privilegedMode")),
+        labels=container_reaper.own_labels("codebuild", **{"ministack.codebuild.build": build["id"]}),
+    )
+    if network:
+        create_kwargs["network"] = network
+    extra_network = None
+    if CODEBUILD_DOCKER_FLAGS:
+        from ministack.services.lambda_svc import _parse_docker_flags
+
+        extra = _parse_docker_flags(CODEBUILD_DOCKER_FLAGS)
+        extra_network = extra.pop("network", None)
+        create_kwargs["environment"].update(extra.pop("environment", {}))
+        create_kwargs.update(extra)
+    container = client.containers.create(image_name, **create_kwargs)
+    try:
+        if extra_network and extra_network != network:
+            # Before the start, so the first command already has the second network.
+            client.networks.get(extra_network).connect(container)
+        container.start()
+    except Exception:
+        container.remove(force=True, v=True)
+        raise
+    return container
+
+
+def _follow_build(build_id, build, project, container):
+    """Stream the build container's output into its log and record the outcome."""
     try:
         emit = _log_sink(build)
     except Exception:
