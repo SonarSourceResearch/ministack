@@ -525,7 +525,7 @@ def _start_agent_build(client, build_id, env, image_name, source_dir, artifacts_
 _PHASES = ("install", "pre_build", "build", "post_build")
 
 
-def _phase_script(buildspec):
+def _phase_script(buildspec, declared=()):
     """A shell script that runs the buildspec's phases the way CodeBuild does.
 
     One shell runs every command, so a `cd` or an exported variable carries to the
@@ -544,12 +544,13 @@ def _phase_script(buildspec):
         if env.get(unsupported):
             raise ValueError(f"buildspec env.{unsupported} is not supported by this executor")
     lines = ["status=0", "failed_before_build=0"]
-    # The lowest precedence, as on CodeBuild: a project or StartBuild variable of the same name,
-    # already in the container's environment, wins.
+    # Below the project's and StartBuild's variables (`declared`), as on CodeBuild, and above
+    # whatever else the shell inherits, the image's ENV included.
     for name, value in (env.get("variables") or {}).items():
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(name)):
             raise ValueError(f"buildspec env.variables name {name!r} is not a variable name")
-        lines.append(f'[ -n "${{{name}+set}}" ] || export {name}={shlex.quote(str(value))}')
+        if name not in declared:
+            lines.append(f"export {name}={shlex.quote(str(value))}")
     phases = spec.get("phases") or {}
     for phase in _PHASES:
         block = phases.get(phase) or {}
@@ -636,7 +637,8 @@ def _start_direct_build(client, build, project, image_name, buildspec):
     from ministack.core.responses import new_uuid as _uuid
 
     env = project.get("environment", {}) or {}
-    script, shell = _phase_script(buildspec)
+    declared = {var.get("name", "") for var in env.get("environmentVariables") or []}
+    script, shell = _phase_script(buildspec, declared)
     network, address = _own_network(client)
     port = os.environ.get("GATEWAY_PORT") or os.environ.get("EDGE_PORT") or "4566"
     endpoint = f"http://{address}:{port}" if address else _aws_endpoint()

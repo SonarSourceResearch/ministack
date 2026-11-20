@@ -46,8 +46,8 @@ ECS `RunTask` and service tasks, when MiniStack starts real containers:
   MiniStack or the containers it started by name. This executor runs the project's image itself, on the
   network MiniStack is on: the buildspec's `install`, `pre_build`, `build` and `post_build` phases run in one
   shell from a generated script (a failed command fails its phase and the later ones, except `post_build`
-  after a failed `build`), `env.variables` are exported unless a project or StartBuild variable of the same
-  name is set, and `env.secrets-manager`, `env.parameter-store`, `env.exported-variables` and a phase's
+  after a failed `build`), `env.variables` are exported unless a project or StartBuild variable has the same
+  name (an inherited one, such as the image's `ENV`, is overridden), and `env.secrets-manager`, `env.parameter-store`, `env.exported-variables` and a phase's
   `finally`, `on-failure` and `run-as` are refused. The service role reaches the build from MiniStack's
   container credentials endpoint (`AWS_CONTAINER_CREDENTIALS_FULL_URI`) unless the project declares keys, with
   `AWS_ENDPOINT_URL` at MiniStack unless the project names one; a

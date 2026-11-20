@@ -681,10 +681,11 @@ def test_phase_script_lets_project_variables_win_over_buildspec_ones(tmp_path):
         "version: 0.2\nenv:\n  variables:\n    TAG: from-buildspec\n    SPACED: 'a b'\n"
         "phases:\n  build:\n    commands:\n      - echo \"$TAG|$SPACED\"\n"
     )
-    script, shell = codebuild._phase_script(spec)
+    script, shell = codebuild._phase_script(spec, declared={"TAG"})
+    # SPACED is inherited (an image ENV): the buildspec still sets it.
     done = subprocess.run(
         [shell, "-c", script], cwd=tmp_path, capture_output=True, text=True,
-        env={"PATH": "/usr/bin:/bin", "TAG": "from-project"},
+        env={"PATH": "/usr/bin:/bin", "TAG": "from-project", "SPACED": "from-image"},
     )
     assert "from-project|a b" in done.stdout.splitlines()
 
