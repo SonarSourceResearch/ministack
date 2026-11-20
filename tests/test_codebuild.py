@@ -604,3 +604,308 @@ def test_execute_build_agent_exit_zero_without_phases_is_fault(monkeypatch, tmp_
 
     assert build["buildStatus"] == "FAULT"
     assert container.removed is True
+
+
+# ========== The "docker" executor (MINISTACK_CODEBUILD_EXECUTOR=docker) ==========
+#
+# The phase script runs in a real shell here; the container around it is faked.
+
+import subprocess  # noqa: E402
+
+PHASED_BUILDSPEC = """
+version: 0.2
+env:
+  shell: bash
+  variables:
+    GREETING: "hello world"
+phases:
+  install:
+    commands:
+      - mkdir -p sub && cd sub
+      - echo "installed in $(basename "$PWD")"
+  build:
+    commands:
+      - echo "$GREETING"
+      - FAIL_HERE
+      - echo never
+  post_build:
+    commands:
+      - echo post
+"""
+
+
+def _run_script(buildspec, tmp_path):
+    script, shell = codebuild._phase_script(buildspec)
+    done = subprocess.run([shell, "-c", script], cwd=tmp_path, capture_output=True, text=True)
+    return done.returncode, done.stdout
+
+
+def test_phase_script_keeps_one_shell_and_runs_post_build_after_a_failed_build(tmp_path):
+    code, out = _run_script(PHASED_BUILDSPEC.replace("FAIL_HERE", "sh -c 'exit 3'"), tmp_path)
+    lines = out.splitlines()
+    assert "installed in sub" in lines  # the install phase's cd carried to its next command
+    assert "hello world" in lines
+    assert "never" not in lines
+    assert "Phase complete: INSTALL State: SUCCEEDED" in lines
+    assert "Phase complete: BUILD State: FAILED" in lines
+    assert "Phase complete: POST_BUILD State: SUCCEEDED" in lines
+    assert "post" in lines
+    assert code == 3
+
+
+def test_phase_script_succeeds_when_every_command_does(tmp_path):
+    code, out = _run_script(PHASED_BUILDSPEC.replace("FAIL_HERE", "echo fine"), tmp_path)
+    assert code == 0
+    assert "never" in out.splitlines()
+
+
+def test_phase_script_skips_later_phases_after_a_failed_install(tmp_path):
+    code, out = _run_script(PHASED_BUILDSPEC.replace("mkdir -p sub && cd sub", "exit_code_7() { return 7; }; exit_code_7"), tmp_path)
+    lines = out.splitlines()
+    assert "Phase complete: INSTALL State: FAILED" in lines
+    assert not any(line.startswith("Phase complete: BUILD") for line in lines)
+    assert "post" not in lines
+    assert code == 7
+
+
+def test_phase_script_reads_json_buildspecs_and_defaults_to_sh(tmp_path):
+    spec = json.dumps({"version": "0.2", "phases": {"build": {"commands": ["echo json"]}}})
+    script, shell = codebuild._phase_script(spec)
+    assert shell == "sh"
+    code, out = _run_script(spec, tmp_path)
+    assert code == 0 and "json" in out.splitlines()
+
+
+def test_phase_script_lets_project_variables_win_over_buildspec_ones(tmp_path):
+    spec = (
+        "version: 0.2\nenv:\n  variables:\n    TAG: from-buildspec\n    SPACED: 'a b'\n"
+        "phases:\n  build:\n    commands:\n      - echo \"$TAG|$SPACED\"\n"
+    )
+    script, shell = codebuild._phase_script(spec, declared={"TAG"})
+    # SPACED is inherited (an image ENV): the buildspec still sets it.
+    done = subprocess.run(
+        [shell, "-c", script], cwd=tmp_path, capture_output=True, text=True,
+        env={"PATH": "/usr/bin:/bin", "TAG": "from-project", "SPACED": "from-image"},
+    )
+    assert "from-project|a b" in done.stdout.splitlines()
+
+
+@pytest.mark.parametrize("key", ["finally", "on-failure", "run-as"])
+def test_phase_script_refuses_phase_keys_it_does_not_run(key):
+    spec = f"version: 0.2\nphases:\n  build:\n    {key}: x\n    commands:\n      - echo hi\n"
+    with pytest.raises(ValueError, match=key):
+        codebuild._phase_script(spec)
+
+
+def test_phase_script_refuses_secret_variables():
+    spec = "version: 0.2\nenv:\n  secrets-manager:\n    TOKEN: arn:x\nphases: {}\n"
+    with pytest.raises(ValueError, match="secrets-manager"):
+        codebuild._phase_script(spec)
+
+
+class _DirectContainer(_FakeContainer):
+    def __init__(self, log_lines, exit_code=0, events=None):
+        super().__init__(log_lines, exit_code)
+        self.id = "build-container"
+        self.events = events if events is not None else []
+
+    def start(self):
+        self.events.append("start")
+
+
+class _DirectContainers:
+    def __init__(self, container, own_networks):
+        self._container = container
+        self._own = own_networks
+        self.image = None
+        self.kwargs = None
+
+    def get(self, name):
+        class _Own:
+            attrs = {"NetworkSettings": {"Networks": self._own}}
+        if name != "ministack":
+            raise KeyError(name)
+        return _Own()
+
+    def create(self, image, **kwargs):
+        self.image = image
+        self.kwargs = kwargs
+        return self._container
+
+    def run(self, *_args, **_kwargs):
+        raise AssertionError("the docker executor never starts the agent")
+
+
+class _DirectNetworks:
+    def __init__(self, events):
+        self.events = events
+
+    def get(self, name):
+        events = self.events
+
+        class _Network:
+            def connect(self, container):
+                events.append(f"connect {name} {container.id}")
+        return _Network()
+
+
+class _DirectDocker:
+    def __init__(self, container, own_networks):
+        self.containers = _DirectContainers(container, own_networks)
+        self.networks = _DirectNetworks(container.events)
+
+
+def _direct(monkeypatch, container, flags=""):
+    docker = _DirectDocker(container, {"vlh-e2e": {"IPAddress": "169.254.170.23"}})
+    monkeypatch.setattr(codebuild, "_get_docker", lambda: docker)
+    monkeypatch.setattr(codebuild, "CODEBUILD_EXECUTOR", "docker")
+    monkeypatch.setattr(codebuild, "CODEBUILD_DOCKER_FLAGS", flags)
+    monkeypatch.setenv("HOSTNAME", "ministack")
+    monkeypatch.setenv("GATEWAY_PORT", "4566")
+    return docker
+
+
+def test_docker_executor_runs_the_project_image_on_ministacks_network(monkeypatch, tmp_path):
+    container = _DirectContainer([
+        "Phase complete: BUILD State: SUCCEEDED",
+    ])
+    docker = _direct(
+        monkeypatch, container,
+        "--network vlh-out --dns 169.254.170.20 -v /host/ca.pem:/etc/ca.pem:ro -e EXTRA=1",
+    )
+    monkeypatch.setattr(codebuild, "WORKSPACE", str(tmp_path))
+    project = _execution_project()
+    build = _seed_execution_build(project, "demo:0101")
+
+    codebuild._execute_build("demo:0101", project)
+
+    assert build["buildStatus"] == "SUCCEEDED"
+    assert docker.containers.image == "aws/codebuild/standard:7.0"
+    kwargs = docker.containers.kwargs
+    assert kwargs["network"] == "vlh-e2e"
+    assert kwargs["privileged"] is True
+    assert kwargs["dns"] == ["169.254.170.20"]
+    # A privileged build's daemon gets a volume of its own; the flags' bind mounts follow.
+    assert [(m["Target"], m["Type"]) for m in kwargs["mounts"]] == [
+        ("/var/lib/docker", "volume"),
+        ("/etc/ca.pem", "bind"),
+    ]
+    shell, flag, script = kwargs["command"]
+    assert (shell, flag) == ("sh", "-c") and "echo hi" in script
+    env = kwargs["environment"]
+    assert env["FOO"] == "bar" and env["EXTRA"] == "1"
+    assert env["CODEBUILD_BUILD_ID"] == "demo:0101"
+    assert env["AWS_ENDPOINT_URL"] == "http://169.254.170.23:4566"
+    assert env["AWS_CONTAINER_CREDENTIALS_FULL_URI"].startswith(
+        "http://169.254.170.23:4566/v2/credentials/"
+    )
+    assert env["AWS_CONTAINER_AUTHORIZATION_TOKEN"]
+    assert "AWS_ACCESS_KEY_ID" not in env
+    assert kwargs["working_dir"] == env["CODEBUILD_SRC_DIR"]
+    # The second network is attached before the first command runs.
+    assert container.events == ["connect vlh-out build-container", "start"]
+    assert container.removed is True
+
+
+def test_docker_executor_keeps_an_endpoint_the_project_declared(monkeypatch, tmp_path):
+    container = _DirectContainer(["Phase complete: BUILD State: SUCCEEDED"])
+    docker = _direct(monkeypatch, container)
+    monkeypatch.setattr(codebuild, "WORKSPACE", str(tmp_path))
+    project = _execution_project()
+    project["environment"]["environmentVariables"].append(
+        {"name": "AWS_ENDPOINT_URL", "value": "http://elsewhere:4566"}
+    )
+    _seed_execution_build(project, "demo:0102")
+
+    codebuild._execute_build("demo:0102", project)
+
+    env = docker.containers.kwargs["environment"]
+    assert env["AWS_ENDPOINT_URL"] == "http://elsewhere:4566"
+    # The service role reaches the build whatever endpoint the project names.
+    assert env["AWS_CONTAINER_CREDENTIALS_FULL_URI"].startswith("http://169.254.170.23:4566/")
+    assert container.events == ["start"]
+
+
+def test_docker_executor_reports_a_failed_phase(monkeypatch, tmp_path):
+    container = _DirectContainer(["Phase complete: BUILD State: FAILED"], exit_code=1)
+    _direct(monkeypatch, container)
+    monkeypatch.setattr(codebuild, "WORKSPACE", str(tmp_path))
+    project = _execution_project()
+    build = _seed_execution_build(project, "demo:0103")
+
+    codebuild._execute_build("demo:0103", project)
+
+    assert build["buildStatus"] == "FAILED"
+
+
+def test_docker_executor_refusing_the_buildspec_is_a_fault(monkeypatch, tmp_path):
+    container = _DirectContainer([])
+    docker = _direct(monkeypatch, container)
+    monkeypatch.setattr(codebuild, "WORKSPACE", str(tmp_path))
+    project = _execution_project(
+        buildspec="version: 0.2\nenv:\n  parameter-store:\n    X: /p\nphases: {}\n"
+    )
+    build = _seed_execution_build(project, "demo:0104")
+
+    codebuild._execute_build("demo:0104", project)
+
+    assert build["buildStatus"] == "FAULT"
+    assert docker.containers.image is None
+
+
+def test_docker_executor_resolves_secret_and_parameter_variables(monkeypatch, tmp_path):
+    from ministack.services import secretsmanager, ssm
+
+    monkeypatch.setattr(
+        secretsmanager,
+        "resolve_secret_string",
+        lambda secret_id, version_stage="AWSCURRENT", version_id=None, cross_account=False: (
+            json.dumps({"username": f"{secret_id}|{version_stage}|{version_id}"})
+        ),
+    )
+    monkeypatch.setattr(ssm, "resolve_parameter_value", lambda name, decrypt=False: f"param {name}")
+    container = _DirectContainer(["Phase complete: BUILD State: SUCCEEDED"])
+    docker = _direct(monkeypatch, container)
+    monkeypatch.setattr(codebuild, "WORKSPACE", str(tmp_path))
+    project = _execution_project()
+    arn = "arn:aws:secretsmanager:us-east-1:000000000000:secret:registry-AbCdEf"
+    project["environment"]["environmentVariables"] += [
+        {"name": "USER", "type": "SECRETS_MANAGER", "value": f"{arn}:username::v-1"},
+        {"name": "WHOLE", "type": "SECRETS_MANAGER", "value": "registry"},
+        {"name": "PARAM", "type": "PARAMETER_STORE", "value": "/team/value"},
+    ]
+    _seed_execution_build(project, "demo:0105")
+
+    codebuild._execute_build("demo:0105", project)
+
+    env = docker.containers.kwargs["environment"]
+    assert env["USER"] == f"{arn}|AWSCURRENT|v-1"
+    assert json.loads(env["WHOLE"]) == {"username": "registry|AWSCURRENT|None"}
+    assert env["PARAM"] == "param /team/value"
+
+
+def test_docker_executor_fails_a_build_whose_secret_does_not_resolve(monkeypatch, tmp_path):
+    from ministack.services import secretsmanager
+
+    monkeypatch.setattr(secretsmanager, "resolve_secret_string", lambda *a, **k: None)
+    container = _DirectContainer([])
+    docker = _direct(monkeypatch, container)
+    monkeypatch.setattr(codebuild, "WORKSPACE", str(tmp_path))
+    project = _execution_project()
+    project["environment"]["environmentVariables"].append(
+        {"name": "USER", "type": "SECRETS_MANAGER", "value": "missing:username"}
+    )
+    build = _seed_execution_build(project, "demo:0106")
+
+    codebuild._execute_build("demo:0106", project)
+
+    assert build["buildStatus"] == "FAULT"
+    assert docker.containers.image is None
+
+
+def test_codebuild_update_and_delete_take_the_project_arn(codebuild):
+    arn = codebuild.create_project(**_project_args("by-arn", "first"))["project"]["arn"]
+    updated = codebuild.update_project(name=arn, description="second")["project"]
+    assert updated["description"] == "second"
+    codebuild.delete_project(name=arn)
+    assert codebuild.batch_get_projects(names=["by-arn"])["projects"] == []

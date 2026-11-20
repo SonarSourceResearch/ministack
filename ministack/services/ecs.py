@@ -1760,9 +1760,24 @@ def _register_metadata(task_arn, cluster_arn, td, cdef, launch_type, env,
         host = "host.docker.internal"
     port = os.environ.get("GATEWAY_PORT") or os.environ.get("EDGE_PORT") or "4566"
     env["ECS_CONTAINER_METADATA_URI_V4"] = f"http://{host}:{port}/v4/{token}"
-    env["AWS_CONTAINER_CREDENTIALS_FULL_URI"] = f"http://{host}:{port}/v2/credentials/{new_uuid()}"
-    env["AWS_CONTAINER_AUTHORIZATION_TOKEN"] = secrets.token_urlsafe(32)
+    if os.environ.get("ECS_CONTAINER_CREDENTIALS", "full").lower() == "relative":
+        # As Fargate hands them over: a path on 169.254.170.2, the address a container's SDK
+        # and an agent-side client that reads only this variable both use. Whoever runs
+        # MiniStack routes that address's port 80 to it, as ECS's agent answers there.
+        env["AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"] = f"/v2/credentials/{new_uuid()}"
+    else:
+        env["AWS_CONTAINER_CREDENTIALS_FULL_URI"] = (
+            f"http://{host}:{port}/v2/credentials/{new_uuid()}"
+        )
+        env["AWS_CONTAINER_AUTHORIZATION_TOKEN"] = secrets.token_urlsafe(32)
     env["AWS_ENDPOINT_URL"] = f"http://{host}:{port}"
+    # What ECS sets in every container besides: the region, which an SDK client made without
+    # one reads, and the launch type. A value the container definition sets is kept.
+    env.setdefault("AWS_REGION", get_region())
+    env.setdefault("AWS_DEFAULT_REGION", get_region())
+    env.setdefault(
+        "AWS_EXECUTION_ENV", "AWS_ECS_FARGATE" if launch_type == "FARGATE" else "AWS_ECS_EC2"
+    )
     # Seeded from the record, not a literal: the task is not RUNNING yet here.
     # Later transitions are pushed by _mark_task_activating/_running/_stopped.
     desired, known, per_container = (
@@ -2969,7 +2984,9 @@ def _run_task(data):
         _ensure_ecs_reaper_thread()
 
     for _ in range(count):
-        task_id = new_uuid()
+        # ECS task ids are 32 lowercase hex characters; a caller may rely on the form (an
+        # IAM policy or an S3 prefix keyed on the id of the task whose credentials sign).
+        task_id = new_uuid().replace("-", "")
         task_arn = f"arn:aws:ecs:{region}:{account_id}:task/{cluster_name}/{task_id}"
         now = _iso()
 

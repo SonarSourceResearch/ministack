@@ -513,3 +513,56 @@ def test_ecs_depends_on_healthy_waits_for_a_real_health_check(ecs):
     task, containers = _await_stopped(ecs, cluster, arn)
     assert containers["app"]["exitCode"] == 0, containers
     ecs.delete_cluster(cluster=cluster)
+
+
+def test_every_container_gets_the_region_and_launch_type_ecs_sets(monkeypatch):
+    from ministack.services import ecs_metadata
+
+    monkeypatch.setattr(ecs_metadata, "register_container", lambda *a, **k: None)
+    task_arn = "arn:aws:ecs:eu-west-1:000000000000:task/c/1"
+    td = {"family": "f", "revision": 1}
+    env = {}
+    _ecs._register_metadata(task_arn, "cluster", td, {"name": "app", "image": "i"}, "FARGATE",
+                            env, False, "169.254.170.23")
+    region = env["AWS_REGION"]
+    assert region and env["AWS_DEFAULT_REGION"] == region
+    assert env["AWS_EXECUTION_ENV"] == "AWS_ECS_FARGATE"
+    # The container definition's own value wins.
+    env = {"AWS_REGION": "us-west-2"}
+    _ecs._register_metadata(task_arn, "cluster", td, {"name": "app", "image": "i"}, "EC2",
+                            env, False, "169.254.170.23")
+    assert env["AWS_REGION"] == "us-west-2"
+    assert env["AWS_EXECUTION_ENV"] == "AWS_ECS_EC2"
+
+
+def test_a_task_id_has_the_form_ecs_gives_it(ecs):
+    import re
+
+    ecs.create_cluster(clusterName="ids")
+    ecs.register_task_definition(
+        family="ids", containerDefinitions=[{"name": "app", "image": "busybox", "memory": 64}]
+    )
+    task = ecs.run_task(cluster="ids", taskDefinition="ids")["tasks"][0]
+    assert re.fullmatch("[0-9a-f]{32}", task["taskArn"].rsplit("/", 1)[-1])
+
+
+def test_containers_can_get_credentials_as_fargate_hands_them_over(monkeypatch):
+    from ministack.services import ecs_metadata
+
+    monkeypatch.setattr(ecs_metadata, "register_container", lambda *a, **k: None)
+    task_arn = "arn:aws:ecs:eu-west-1:000000000000:task/c/1"
+    td = {"family": "f", "revision": 1}
+    env = {}
+    _ecs._register_metadata(task_arn, "cluster", td, {"name": "app", "image": "i"}, "FARGATE",
+                            env, False, "169.254.170.23")
+    assert env["AWS_CONTAINER_CREDENTIALS_FULL_URI"].startswith("http://169.254.170.23:")
+    assert env["AWS_CONTAINER_AUTHORIZATION_TOKEN"]
+    assert "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI" not in env
+
+    monkeypatch.setenv("ECS_CONTAINER_CREDENTIALS", "relative")
+    env = {}
+    _ecs._register_metadata(task_arn, "cluster", td, {"name": "app", "image": "i"}, "FARGATE",
+                            env, False, "169.254.170.23")
+    assert env["AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"].startswith("/v2/credentials/")
+    assert "AWS_CONTAINER_CREDENTIALS_FULL_URI" not in env
+    assert "AWS_CONTAINER_AUTHORIZATION_TOKEN" not in env
