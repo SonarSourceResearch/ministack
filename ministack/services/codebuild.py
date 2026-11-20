@@ -575,6 +575,41 @@ def _phase_script(buildspec):
     return "\n".join(lines) + "\n", env.get("shell") or "sh"
 
 
+def _variable_value(variable):
+    """An environment variable's value as CodeBuild hands it to the build: a SECRETS_MANAGER
+    one (`secret-id:json-key:version-stage:version-id`, every part after the id optional) or a
+    PARAMETER_STORE one is resolved, and one that cannot be is an error, as it fails the build
+    on AWS rather than starting it without the variable."""
+    kind = variable.get("type", "PLAINTEXT")
+    value = variable.get("value", "")
+    name = variable.get("name", "")
+    if kind == "PARAMETER_STORE":
+        from ministack.services import ssm
+
+        found = ssm.resolve_parameter_value(value, decrypt=True)
+    elif kind == "SECRETS_MANAGER":
+        from ministack.services import secretsmanager
+
+        parts = value.split(":")
+        # An ARN has seven colon-separated fields of its own.
+        width = 7 if value.startswith("arn:") else 1
+        secret_id = ":".join(parts[:width])
+        json_key, stage, version = (parts[width:] + ["", "", ""])[:3]
+        found = secretsmanager.resolve_secret_string(
+            secret_id, version_stage=stage or "AWSCURRENT", version_id=version or None
+        )
+        if found is not None and json_key:
+            try:
+                found = json.loads(found)[json_key]
+            except (ValueError, KeyError, TypeError):
+                found = None
+    else:
+        return value
+    if found is None:
+        raise ValueError(f"environment variable {name}: {kind} reference {value} does not resolve")
+    return str(found)
+
+
 def _own_network(client):
     """(network, address) of MiniStack's own container, as ECS tasks find it; Nones off Docker."""
     try:
@@ -597,7 +632,9 @@ def _start_direct_build(client, build, project, image_name, buildspec):
     network, address = _own_network(client)
     port = os.environ.get("GATEWAY_PORT") or os.environ.get("EDGE_PORT") or "4566"
     endpoint = f"http://{address}:{port}" if address else _aws_endpoint()
-    variables = {var.get("name", ""): var.get("value", "") for var in env.get("environmentVariables") or []}
+    variables = {
+        var.get("name", ""): _variable_value(var) for var in env.get("environmentVariables") or []
+    }
     variables.update({
         "CODEBUILD_BUILD_ID": build["id"],
         "CODEBUILD_BUILD_ARN": build["arn"],
@@ -619,11 +656,20 @@ def _start_direct_build(client, build, project, image_name, buildspec):
         else:
             variables.setdefault("AWS_ACCESS_KEY_ID", "test")
             variables.setdefault("AWS_SECRET_ACCESS_KEY", "test")
+    privileged = bool(env.get("privilegedMode"))
+    mounts = []
+    if privileged:
+        import docker as docker_lib
+
+        # A privileged build may run its own Docker daemon, as on CodeBuild. Its data root
+        # goes on a volume of its own, removed with the container: on the container's own
+        # overlay root filesystem, overlay2 cannot stack and the daemon does not start.
+        mounts.append(docker_lib.types.Mount("/var/lib/docker", None, type="volume"))
     create_kwargs = dict(
         command=[shell, "-c", script],
         working_dir=variables["CODEBUILD_SRC_DIR"],
         environment=variables,
-        privileged=bool(env.get("privilegedMode")),
+        privileged=privileged,
         labels=container_reaper.own_labels("codebuild", **{"ministack.codebuild.build": build["id"]}),
     )
     if network:
@@ -635,7 +681,10 @@ def _start_direct_build(client, build, project, image_name, buildspec):
         extra = _parse_docker_flags(CODEBUILD_DOCKER_FLAGS)
         extra_network = extra.pop("network", None)
         create_kwargs["environment"].update(extra.pop("environment", {}))
+        mounts += extra.pop("mounts", [])
         create_kwargs.update(extra)
+    if mounts:
+        create_kwargs["mounts"] = mounts
     container = client.containers.create(image_name, **create_kwargs)
     try:
         if extra_network and extra_network != network:

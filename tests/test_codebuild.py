@@ -763,7 +763,11 @@ def test_docker_executor_runs_the_project_image_on_ministacks_network(monkeypatc
     assert kwargs["network"] == "vlh-e2e"
     assert kwargs["privileged"] is True
     assert kwargs["dns"] == ["169.254.170.20"]
-    assert [m["Target"] for m in kwargs["mounts"]] == ["/etc/ca.pem"]
+    # A privileged build's daemon gets a volume of its own; the flags' bind mounts follow.
+    assert [(m["Target"], m["Type"]) for m in kwargs["mounts"]] == [
+        ("/var/lib/docker", "volume"),
+        ("/etc/ca.pem", "bind"),
+    ]
     shell, flag, script = kwargs["command"]
     assert (shell, flag) == ("sh", "-c") and "echo hi" in script
     env = kwargs["environment"]
@@ -821,6 +825,56 @@ def test_docker_executor_refusing_the_buildspec_is_a_fault(monkeypatch, tmp_path
     build = _seed_execution_build(project, "demo:0104")
 
     codebuild._execute_build("demo:0104", project)
+
+    assert build["buildStatus"] == "FAULT"
+    assert docker.containers.image is None
+
+
+def test_docker_executor_resolves_secret_and_parameter_variables(monkeypatch, tmp_path):
+    from ministack.services import secretsmanager, ssm
+
+    monkeypatch.setattr(
+        secretsmanager,
+        "resolve_secret_string",
+        lambda secret_id, version_stage="AWSCURRENT", version_id=None, cross_account=False: (
+            json.dumps({"username": f"{secret_id}|{version_stage}|{version_id}"})
+        ),
+    )
+    monkeypatch.setattr(ssm, "resolve_parameter_value", lambda name, decrypt=False: f"param {name}")
+    container = _DirectContainer(["Phase complete: BUILD State: SUCCEEDED"])
+    docker = _direct(monkeypatch, container)
+    monkeypatch.setattr(codebuild, "WORKSPACE", str(tmp_path))
+    project = _execution_project()
+    arn = "arn:aws:secretsmanager:us-east-1:000000000000:secret:registry-AbCdEf"
+    project["environment"]["environmentVariables"] += [
+        {"name": "USER", "type": "SECRETS_MANAGER", "value": f"{arn}:username::v-1"},
+        {"name": "WHOLE", "type": "SECRETS_MANAGER", "value": "registry"},
+        {"name": "PARAM", "type": "PARAMETER_STORE", "value": "/team/value"},
+    ]
+    _seed_execution_build(project, "demo:0105")
+
+    codebuild._execute_build("demo:0105", project)
+
+    env = docker.containers.kwargs["environment"]
+    assert env["USER"] == f"{arn}|AWSCURRENT|v-1"
+    assert json.loads(env["WHOLE"]) == {"username": "registry|AWSCURRENT|None"}
+    assert env["PARAM"] == "param /team/value"
+
+
+def test_docker_executor_fails_a_build_whose_secret_does_not_resolve(monkeypatch, tmp_path):
+    from ministack.services import secretsmanager
+
+    monkeypatch.setattr(secretsmanager, "resolve_secret_string", lambda *a, **k: None)
+    container = _DirectContainer([])
+    docker = _direct(monkeypatch, container)
+    monkeypatch.setattr(codebuild, "WORKSPACE", str(tmp_path))
+    project = _execution_project()
+    project["environment"]["environmentVariables"].append(
+        {"name": "USER", "type": "SECRETS_MANAGER", "value": "missing:username"}
+    )
+    build = _seed_execution_build(project, "demo:0106")
+
+    codebuild._execute_build("demo:0106", project)
 
     assert build["buildStatus"] == "FAULT"
     assert docker.containers.image is None
