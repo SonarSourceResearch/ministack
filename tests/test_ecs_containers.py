@@ -533,3 +533,14 @@ def test_every_container_gets_the_region_and_launch_type_ecs_sets(monkeypatch):
                             env, False, "169.254.170.23")
     assert env["AWS_REGION"] == "us-west-2"
     assert env["AWS_EXECUTION_ENV"] == "AWS_ECS_EC2"
+
+
+def test_a_task_id_has_the_form_ecs_gives_it(ecs):
+    import re
+
+    ecs.create_cluster(clusterName="ids")
+    ecs.register_task_definition(
+        family="ids", containerDefinitions=[{"name": "app", "image": "busybox", "memory": 64}]
+    )
+    task = ecs.run_task(cluster="ids", taskDefinition="ids")["tasks"][0]
+    assert re.fullmatch("[0-9a-f]{32}", task["taskArn"].rsplit("/", 1)[-1])

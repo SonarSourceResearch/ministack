@@ -2976,7 +2976,9 @@ def _run_task(data):
         _ensure_ecs_reaper_thread()
 
     for _ in range(count):
-        task_id = new_uuid()
+        # ECS task ids are 32 lowercase hex characters; a caller may rely on the form (an
+        # IAM policy or an S3 prefix keyed on the id of the task whose credentials sign).
+        task_id = new_uuid().replace("-", "")
         task_arn = f"arn:aws:ecs:{region}:{account_id}:task/{cluster_name}/{task_id}"
         now = _iso()
 

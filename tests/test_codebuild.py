@@ -740,6 +740,7 @@ def _direct(monkeypatch, container, flags=""):
     monkeypatch.setattr(codebuild, "CODEBUILD_EXECUTOR", "docker")
     monkeypatch.setattr(codebuild, "CODEBUILD_DOCKER_FLAGS", flags)
     monkeypatch.setenv("HOSTNAME", "ministack")
+    monkeypatch.setenv("GATEWAY_PORT", "4566")
     return docker
 
 
