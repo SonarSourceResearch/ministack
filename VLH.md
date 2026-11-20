@@ -58,6 +58,20 @@ ECS `RunTask` and service tasks, when MiniStack starts real containers:
   (`http://ministack:4566/v2/...`) instead of `https://<account>.dkr.ecr.<region>.amazonaws.com/v2/...`,
   which a client reaches only through a TLS front whose certificate it trusts. Tests:
   `tests/test_ecr.py::test_layer_download_url_*`.
+- **What ECS sets in every container:** `AWS_REGION`, `AWS_DEFAULT_REGION` and `AWS_EXECUTION_ENV`
+  (`AWS_ECS_FARGATE` or `AWS_ECS_EC2`), unless the container definition sets them. An SDK client made
+  without a region failed in a MiniStack task and works on Fargate.
+- **Task ids of 32 hexadecimal characters**, as ECS gives them, in place of a dashed UUID: a caller that
+  keys something on the id checks its form.
+- **`ECS_CONTAINER_CREDENTIALS=relative`** hands task credentials over as Fargate does:
+  `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI`, a path its clients fetch from `169.254.170.2:80`, in place of
+  `AWS_CONTAINER_CREDENTIALS_FULL_URI` at MiniStack's address. Whoever runs MiniStack routes that address to
+  MiniStack's port, as ECS's agent answers there. A client that reads only the relative URI, or takes
+  credentials only from that address, had none.
+- **CodeBuild `UpdateProject` and `DeleteProject` take the project's ARN** as well as its name. The
+  Terraform provider sends the ARN, so `pulumi destroy` of a project failed with `Project not found`.
+- Tests for the four: `tests/test_ecs_containers.py` (`region_and_launch_type`, `task_id`,
+  `credentials_as_fargate`) and `tests/test_codebuild.py::test_codebuild_update_and_delete_take_the_project_arn`.
 
 ## Running the tests
 
